@@ -12,15 +12,40 @@ provider "aws" {
   region = "us-east-1"
 }
 
+data "aws_caller_identity" "current" {}
+
+data "aws_vpc" "default" {
+  default = true
+}
+
+data "aws_subnets" "default" {
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.default.id]
+  }
+  # us-east-1e does not support MSK — exclude it
+  filter {
+    name   = "availabilityZone"
+    values = ["us-east-1a", "us-east-1b", "us-east-1c", "us-east-1d", "us-east-1f"]
+  }
+}
+
+data "aws_security_group" "default" {
+  name   = "default"
+  vpc_id = data.aws_vpc.default.id
+}
+
 # ---------------------------------------------------------------------------
 # aws_mq_broker
 # ---------------------------------------------------------------------------
 
 resource "aws_mq_broker" "main" {
-  broker_name        = "nist-test-broker"
-  engine_type        = "ActiveMQ"
-  engine_version     = "5.17.6"
-  host_instance_type = "mq.t3.micro"
+  broker_name                = "nist-test-broker"
+  engine_type                = "ActiveMQ"
+  engine_version             = "5.18"
+  host_instance_type         = "mq.t3.micro"
+  auto_minor_version_upgrade = true
+  security_groups            = [data.aws_security_group.default.id]
 
   user {
     username = "mqadmin"
@@ -32,21 +57,35 @@ resource "aws_mq_broker" "main" {
 # aws_cloudwatch_event_endpoint
 # ---------------------------------------------------------------------------
 
+resource "aws_route53_health_check" "endpoint_primary" {
+  type                   = "CALCULATED"
+  child_healthchecks     = []
+  child_health_threshold = 0
+
+  tags = {
+    Name = "nist-test-endpoint-primary"
+  }
+}
+
 resource "aws_cloudwatch_event_endpoint" "main" {
   name = "nist-test-endpoint"
 
-  event_bus {
-    event_bus_arn = "arn:aws:events:us-east-1:123456789012:event-bus/default"
+  replication_config {
+    state = "DISABLED"
   }
 
   event_bus {
-    event_bus_arn = "arn:aws:events:us-west-2:123456789012:event-bus/default"
+    event_bus_arn = "arn:aws:events:us-east-1:${data.aws_caller_identity.current.account_id}:event-bus/default"
+  }
+
+  event_bus {
+    event_bus_arn = "arn:aws:events:us-west-2:${data.aws_caller_identity.current.account_id}:event-bus/default"
   }
 
   routing_config {
     failover_config {
       primary {
-        health_check = "arn:aws:route53:::healthcheck/abc12345-0000-0000-0000-000000000000"
+        health_check = aws_route53_health_check.endpoint_primary.arn
       }
       secondary {
         route = "us-west-2"
@@ -100,8 +139,8 @@ resource "aws_msk_cluster" "main" {
 
   broker_node_group_info {
     instance_type   = "kafka.t3.small"
-    client_subnets  = ["subnet-aaaaaaaa", "subnet-bbbbbbbb", "subnet-cccccccc"]
-    security_groups = ["sg-00000000000000000"]
+    client_subnets  = slice(data.aws_subnets.default.ids, 0, 3)
+    security_groups = [data.aws_security_group.default.id]
 
     storage_info {
       ebs_storage_info {
@@ -118,6 +157,7 @@ resource "aws_msk_cluster" "main" {
 resource "aws_neptune_cluster" "main" {
   cluster_identifier  = "nist-test-neptune"
   engine              = "neptune"
+  deletion_protection = false
   skip_final_snapshot = true
   apply_immediately   = true
 }
@@ -138,10 +178,11 @@ resource "aws_networkfirewall_firewall_policy" "main" {
 resource "aws_networkfirewall_firewall" "main" {
   name                = "nist-test-firewall"
   firewall_policy_arn = aws_networkfirewall_firewall_policy.main.arn
-  vpc_id              = "vpc-00000000000000000"
+  vpc_id              = data.aws_vpc.default.id
+  delete_protection   = false
 
   subnet_mapping {
-    subnet_id = "subnet-aaaaaaaa"
+    subnet_id = data.aws_subnets.default.ids[0]
   }
 }
 
@@ -196,13 +237,11 @@ resource "aws_backup_selection" "main" {
   name         = "nist-test-selection"
   plan_id      = aws_backup_plan.main.id
   iam_role_arn = aws_iam_role.backup.arn
-  resources    = ["arn:aws:rds:us-east-1:123456789012:db:nist-test-db"]
+  resources    = ["arn:aws:rds:us-east-1:${data.aws_caller_identity.current.account_id}:db:nist-test-db"]
 }
 
-resource "aws_backup_vault_lock_configuration" "main" {
-  backup_vault_name  = aws_backup_vault.main.name
-  min_retention_days = 7
-}
+# aws_backup_vault_lock_configuration omitted — vault lock is irreversible
+# during min_retention_days and would prevent destroy in test environments.
 
 # ---------------------------------------------------------------------------
 # aws_db_instance
@@ -211,13 +250,13 @@ resource "aws_backup_vault_lock_configuration" "main" {
 resource "aws_db_instance" "main" {
   identifier     = "nist-test-db"
   engine         = "mysql"
-  engine_version = "8.0.35"
+  engine_version = "8.0"
   instance_class = "db.t3.medium"
 
-  allocated_storage = 20
-  username          = "dbadmin"
-  password          = "Ch@ngeMe2024!"
-
+  allocated_storage   = 20
+  username            = "dbadmin"
+  password            = "ChangeMe2024"
+  deletion_protection = false
   skip_final_snapshot = true
 }
 
@@ -234,7 +273,11 @@ resource "aws_redshiftserverless_namespace" "main" {
 # ---------------------------------------------------------------------------
 
 resource "aws_s3_bucket" "main" {
-  bucket = "nist-test-bucket-main"
+  bucket = "nist-test-bucket-main-${data.aws_caller_identity.current.account_id}"
+}
+
+resource "aws_s3_bucket" "replica" {
+  bucket = "nist-test-bucket-replica-${data.aws_caller_identity.current.account_id}"
 }
 
 resource "aws_s3_bucket_versioning" "main" {
@@ -254,7 +297,7 @@ resource "aws_s3_bucket_replication_configuration" "main" {
     status = "Enabled"
 
     destination {
-      bucket        = "arn:aws:s3:::nist-test-bucket-replica"
+      bucket        = aws_s3_bucket.replica.arn
       storage_class = "STANDARD"
     }
   }
@@ -273,6 +316,14 @@ resource "aws_iam_role" "s3_replication" {
       Action    = "sts:AssumeRole"
     }]
   })
+}
+
+resource "aws_s3_bucket_versioning" "replica" {
+  bucket = aws_s3_bucket.replica.id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
 }
 
 resource "aws_s3_bucket_lifecycle_configuration" "main" {
@@ -306,6 +357,35 @@ resource "aws_iam_role" "sagemaker" {
   })
 }
 
+resource "aws_iam_role_policy_attachment" "sagemaker_feature_store" {
+  role       = aws_iam_role.sagemaker.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSageMakerFeatureStoreAccess"
+}
+
+resource "aws_iam_role_policy" "sagemaker_s3" {
+  name = "nist-test-sagemaker-s3"
+  role = aws_iam_role.sagemaker.name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "s3:GetBucketAcl",
+        "s3:GetBucketLocation",
+        "s3:PutObject",
+        "s3:GetObject",
+        "s3:DeleteObject",
+        "s3:ListBucket",
+      ]
+      Resource = [
+        aws_s3_bucket.main.arn,
+        "${aws_s3_bucket.main.arn}/*",
+      ]
+    }]
+  })
+}
+
 resource "aws_sagemaker_feature_group" "main" {
   feature_group_name             = "nist-test-feature-group"
   record_identifier_feature_name = "record_id"
@@ -324,9 +404,14 @@ resource "aws_sagemaker_feature_group" "main" {
 
   offline_store_config {
     s3_storage_config {
-      s3_uri = "s3://nist-test-bucket-main/feature-store"
+      s3_uri = "s3://${aws_s3_bucket.main.bucket}/feature-store"
     }
   }
+
+  depends_on = [
+    aws_iam_role_policy_attachment.sagemaker_feature_store,
+    aws_iam_role_policy.sagemaker_s3,
+  ]
 }
 
 # ---------------------------------------------------------------------------
